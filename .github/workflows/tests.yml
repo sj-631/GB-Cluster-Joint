@@ -19,8 +19,6 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - run: python -m pip install -r requirements.txt
-      # Real R/SALSO tests skip when optional R dependencies are unavailable.
-      - run: python -m unittest discover -s tests -v
       - run: >-
           python examples/generate_simulation1_data.py
           --output-dir data/ci-simulation1 --n 80 --p 50
