@@ -12,8 +12,7 @@ def calibrate_lambda_reconstruction(
     *,
     target_gradient_ratio: float,
 ) -> float:
-
-
+    """Calibrate the reconstruction weight from the median encoder gradient ratio."""
     ratios = np.asarray(reconstruction_to_clustering_gradient_ratios, dtype=float)
     if ratios.ndim != 1 or ratios.size == 0:
         raise ValueError("At least one gradient ratio is required.")

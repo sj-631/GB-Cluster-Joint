@@ -17,50 +17,40 @@ Optimizer = Literal["sgd", "adam"]
 
 @dataclass
 class TrainConfig:
-    """Training and posterior-sampling settings.
 
-    The statistical loss is the raw, unnormalised total
-
-        lambda_reconstruction * reconstruction_SSE + clustering_SSE.
-
-    ``eta_a`` and ``eta_b`` are the Gamma prior shape and rate. The updated
-    shape is ``eta_a + eta_shape_scale * n * (p + d) / 2``. The positive
-    scale defaults to one and changes only the extended-loss log-eta term,
-    not the prior shape or rate. Non-unit scales are sensitivity variants.
-
-    ``eta_multiplier`` separately scales the mean used by allocation and
-    neural updates, without changing that base Gamma update. A non-unit
-    value is an algorithmic sensitivity experiment, not exact coordinate
-    ascent for the original generalized posterior.
-    """
 
     x_path: Path
     y_path: Path | None
     output_dir: Path
 
-    n_clusters: int = 3
+    n_clusters: int = 4
     z_dim: int = 6
     hidden_dim: int = 128
     dropout: float = 0.0
-    architecture: Architecture = "mlp_ln_gelu"
+    architecture: Architecture = "linear"
 
     batch_size: int = 64
     pretrain_epochs: int = 100
     outer_iterations: int = 100
     joint_epochs_per_outer: int = 1
-    gibbs_sweeps_per_outer: int = 5
+    gibbs_sweeps_per_outer: int = 10
     mc_partitions: int = 5
+    # A sequential chain retains the last M of B sweeps, not spaced draws.
     # MC sample count is separate from the number of persistent chains.
     partition_sampler: str = "single_chain_sequential"
     initial_chain_burnin_sweeps: int = 0
     partition_initialization: str = "latent_kmeans"
     initial_partition_path: Path | None = None
+    # Optional final-warmup override for the actual Gibbs start. A supplied
+    # partition still serves before/intermediate-warmup calibration if selected.
+    postwarm_partition_initialization: str = "latent_hartigan"
+    hartigan_n_starts: int = 100
     # Optional linear-AE scale constraint; changes the clustering loss and prior.
     # Optimizer states are unchanged by the projection.
-    latent_scale_projection: bool = False
+    latent_scale_projection: bool = True
 
-    posterior_burnin_sweeps: int = 100
-    posterior_samples: int = 100
+    posterior_burnin_sweeps: int = 0
+    posterior_samples: int = 500
     posterior_thinning: int = 1
     posterior_summary: PosteriorSummary = "salso"
     salso_n_runs: int = 64
@@ -74,6 +64,9 @@ class TrainConfig:
     gradient_epsilon: float = 1e-12
     calibration_batches: int | None = None
     lambda_calibration_stage: str = "after_warmup"
+    # Calibrate once after t=10 completed warmup epochs, then keep lambda fixed.
+    # None follows the stage setting; an explicit epoch takes precedence.
+    lambda_calibration_epoch: int | None = 10
     eta_initialization: str = "pretrained_loss"
 
     eta_a: float = 1.0
@@ -82,14 +75,14 @@ class TrainConfig:
     eta_multiplier: float = 1.0
     optimizer: Optimizer = "adam"
     # Adam defaults. SGD requires separately chosen learning rates.
-    lr_pretrain: float = 5e-4
-    lr_joint: float = 2e-4
+    lr_pretrain: float = 0.005
+    lr_joint: float = 0.001
     encoder_prior_precision: float = 1e-4
     decoder_prior_precision: float = 1e-4
 
     standardize: StandardizeMode = "none"
     seed: int = 125
-    device: str = "auto"
+    device: str = "cpu"
     num_workers: int = 0
     verbose: bool = True
     save_diagnostics: bool = False
@@ -98,6 +91,22 @@ class TrainConfig:
     @property
     def n_chains(self) -> int:
         return 1 if self.partition_sampler == "single_chain_sequential" else self.mc_partitions
+
+    @property
+    def resolved_lambda_calibration_epoch(self) -> int:
+        if self.lambda_calibration_epoch is not None:
+            return self.lambda_calibration_epoch
+        return 0 if self.lambda_calibration_stage == "before_warmup" else self.pretrain_epochs
+
+    @property
+    def resolved_lambda_calibration_stage(self) -> str:
+        if self.lambda_calibration_epoch is None:
+            return self.lambda_calibration_stage
+        if self.lambda_calibration_epoch == 0:
+            return "before_warmup"
+        if self.lambda_calibration_epoch == self.pretrain_epochs:
+            return "after_warmup"
+        return "during_warmup"
 
     def validate(self) -> None:
         integer_positive = {
@@ -115,6 +124,10 @@ class TrainConfig:
             "salso_n_cores": self.salso_n_cores,
         }
         for name, value in integer_positive.items():
+            if name in {"gibbs_sweeps_per_outer", "mc_partitions"} and (
+                not isinstance(value, int) or isinstance(value, bool)
+            ):
+                raise ValueError(f"{name} must be a positive integer.")
             if value < 1:
                 raise ValueError(f"{name} must be positive.")
         if self.n_clusters < 2:
@@ -123,27 +136,66 @@ class TrainConfig:
             raise ValueError("Unknown partition_sampler.")
         if self.partition_initialization not in {"latent_kmeans", "provided"}:
             raise ValueError("partition_initialization must be 'latent_kmeans' or 'provided'.")
-        if (self.partition_initialization == "provided") != (self.initial_partition_path is not None):
-            raise ValueError("initial_partition_path is required exactly when partition_initialization='provided'.")
+        if self.partition_initialization == "provided":
+            supplied_partition_unused = (
+                self.postwarm_partition_initialization == "latent_hartigan"
+                and self.resolved_lambda_calibration_stage == "after_warmup"
+            )
+            if self.initial_partition_path is None and not supplied_partition_unused:
+                raise ValueError(
+                    "initial_partition_path is required for partition_initialization='provided', "
+                    "unless final latent Hartigan--Wong supplies both calibration and Gibbs initialization."
+                )
+        elif self.initial_partition_path is not None:
+            raise ValueError("initial_partition_path requires partition_initialization='provided'.")
+        if self.postwarm_partition_initialization not in {"unchanged", "latent_hartigan"}:
+            raise ValueError("postwarm_partition_initialization must be 'unchanged' or 'latent_hartigan'.")
+        if (
+            not isinstance(self.hartigan_n_starts, int)
+            or isinstance(self.hartigan_n_starts, bool)
+            or self.hartigan_n_starts < 1
+        ):
+            raise ValueError("hartigan_n_starts must be a positive integer.")
+        if self.postwarm_partition_initialization == "latent_hartigan" and (
+            not isinstance(self.seed, int) or isinstance(self.seed, bool)
+            or not 0 <= self.seed <= 2**31 - 1
+        ):
+            raise ValueError("Hartigan--Wong requires a non-negative signed 32-bit seed.")
         if not isinstance(self.latent_scale_projection, bool):
             raise ValueError("latent_scale_projection must be a boolean.")
         if self.latent_scale_projection and self.architecture != "linear":
             raise ValueError("latent_scale_projection currently supports only architecture='linear'.")
+        if (
+            not isinstance(self.pretrain_epochs, int)
+            or isinstance(self.pretrain_epochs, bool)
+            or self.pretrain_epochs < 0
+        ):
+            raise ValueError("pretrain_epochs must be a non-negative integer.")
         if self.lambda_calibration_stage not in {"before_warmup", "after_warmup"}:
             raise ValueError("Unknown lambda_calibration_stage.")
-        if self.eta_initialization not in {"prior_mean", "pretrained_loss"}:
+        if self.lambda_calibration_epoch is not None and (
+            not isinstance(self.lambda_calibration_epoch, int)
+            or isinstance(self.lambda_calibration_epoch, bool)
+            or not 0 <= self.lambda_calibration_epoch <= self.pretrain_epochs
+        ):
+            raise ValueError(
+                "lambda_calibration_epoch must be an integer between 0 and pretrain_epochs, or None."
+            )
+        if self.eta_initialization == "prior_mean":
+            raise ValueError("Use eta_initialization='zero_loss': this option is not the prior mean.")
+        if self.eta_initialization not in {"zero_loss", "pretrained_loss"}:
             raise ValueError("Unknown eta_initialization.")
+        if self.postwarm_partition_initialization == "latent_hartigan" and self.eta_initialization != "pretrained_loss":
+            raise ValueError("latent_hartigan requires eta_initialization='pretrained_loss'.")
         if self.partition_sampler == "single_chain_sequential":
-            if self.gibbs_sweeps_per_outer % self.mc_partitions != 0:
-                raise ValueError("Sequential sweeps must be a positive multiple of mc_partitions.")
-            if self.initial_chain_burnin_sweeps % self.mc_partitions != 0:
-                raise ValueError("Sequential initial burn-in must be a multiple of mc_partitions.")
-        if self.pretrain_epochs < 0:
-            raise ValueError("pretrain_epochs must be non-negative.")
-        if self.initial_chain_burnin_sweeps < 0:
-            raise ValueError("initial_chain_burnin_sweeps must be non-negative.")
-        if self.posterior_burnin_sweeps < 0:
-            raise ValueError("posterior_burnin_sweeps must be non-negative.")
+            if self.gibbs_sweeps_per_outer < self.mc_partitions:
+                raise ValueError("Sequential sweeps B must be at least mc_partitions M.")
+        for name, value in {
+            "initial_chain_burnin_sweeps": self.initial_chain_burnin_sweeps,
+            "posterior_burnin_sweeps": self.posterior_burnin_sweeps,
+        }.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer.")
         if self.posterior_samples < self.mc_partitions:
             raise ValueError("posterior_samples must be at least mc_partitions.")
         if self.architecture not in SUPPORTED_ARCHITECTURES:

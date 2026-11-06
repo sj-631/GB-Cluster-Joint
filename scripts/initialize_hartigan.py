@@ -1,4 +1,4 @@
-"""Create a raw-feature Hartigan--Wong initializer without using reference labels."""
+"""Create a Hartigan--Wong partition of supplied features, without reference labels."""
 from __future__ import annotations
 
 import argparse
@@ -73,7 +73,8 @@ def main(argv=None):
         request_path = temporary / "request.json"
         request_path.write_text(json.dumps(request), encoding="utf-8")
         fitted = subprocess.run([rscript, "--vanilla", str(bridge), str(request_path)],
-                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                timeout=1800)
         (output / "r_output.log").write_text(fitted.stdout, encoding="utf-8")
         if fitted.returncode:
             raise RuntimeError(f"R initialization failed; inspect {output / 'r_output.log'}")

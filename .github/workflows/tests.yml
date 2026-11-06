@@ -21,8 +21,11 @@ jobs:
       - run: python -m pip install -r requirements.txt
       # Real R/SALSO tests skip when optional R dependencies are unavailable.
       - run: python -m unittest discover -s tests -v
-      - run: python examples/generate_toy_data.py --output-dir data/ci-toy --seed 123
+      - run: >-
+          python examples/generate_simulation1_data.py
+          --output-dir data/ci-simulation1 --n 80 --p 50
+          --n-clusters 4 --gamma 0.4 --seed 123
       - run: >-
           python train.py --preset presets/smoke.json
-          --x-path data/ci-toy/X.npy --y-path data/ci-toy/y.npy
-          --output-dir outputs/ci-smoke --n-clusters 3 --device cpu
+          --x-path data/ci-simulation1/X.npy --y-path data/ci-simulation1/y.npy
+          --output-dir outputs/ci-smoke --n-clusters 4 --device cpu

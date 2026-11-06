@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import fields
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,157 +22,68 @@ from gb_joint.utils import save_json, sha256_file
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         allow_abbrev=False,
-        description=(
-            "Fit generalized Bayes clustering with an autoencoder: "
-            "lambda_R times raw reconstruction SSE plus raw cluster SSE."
-        )
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="GB Cluster--Joint: lambda_R * reconstruction SSE + clustering SSE.",
     )
-    parser.add_argument(
-        "--preset",
-        type=Path,
-        default=None,
-        help=(
-            "Optional JSON file supplying method/architecture defaults. "
-            "Explicit command-line options take precedence."
-        ),
-    )
+    defaults = {field.name: field.default for field in fields(TrainConfig)}
+
+    def option(name: str, **kwargs) -> None:
+        parser.add_argument("--" + name.replace("_", "-"), default=defaults[name], **kwargs)
+
+    parser.add_argument("--preset", type=Path, help="JSON settings; explicit CLI options take precedence.")
     parser.add_argument("--x-path", type=Path, required=True)
-    parser.add_argument(
-        "--y-path",
-        type=Path,
-        default=None,
-        help="Optional reference labels used only for post-fit evaluation.",
-    )
+    parser.add_argument("--y-path", type=Path, help="Optional reference labels, for evaluation only.")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--n-clusters", type=int, required=True)
-    parser.add_argument("--z-dim", type=int, default=6)
-    parser.add_argument("--hidden-dim", type=int, default=128)
-    parser.add_argument(
-        "--hidden-dims", type=int, nargs="+", default=None,
-        help="Encoder hidden widths for architecture=mlp, e.g. 256 64; overrides --hidden-dim.",
-    )
-    parser.add_argument(
-        "--dropout", type=float, default=0.0,
-        help="Must be zero for deterministic encoder and decoder maps.",
-    )
-    parser.add_argument(
-        "--architecture",
-        choices=SUPPORTED_ARCHITECTURES,
-        default="mlp_ln_gelu",
-    )
+    option("architecture", choices=SUPPORTED_ARCHITECTURES)
+    option("hidden_dims", type=int, nargs="+", help="MLP hidden widths, e.g. 256 64; overrides hidden-dim.")
+    option("dropout", type=float, help="Must be zero for deterministic network maps.")
+    for name in (
+        "z_dim", "hidden_dim", "batch_size", "pretrain_epochs", "outer_iterations",
+        "joint_epochs_per_outer", "hartigan_n_starts", "initial_chain_burnin_sweeps",
+        "posterior_samples", "posterior_thinning", "salso_n_runs", "salso_n_cores",
+        "psm_max_n", "calibration_batches", "seed", "num_workers",
+    ):
+        option(name, type=int)
+    for name in (
+        "gradient_epsilon", "eta_a", "eta_b", "lr_pretrain", "lr_joint",
+        "encoder_prior_precision", "decoder_prior_precision",
+    ):
+        option(name, type=float)
 
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--pretrain-epochs", type=int, default=100)
-    parser.add_argument("--outer-iterations", type=int, default=100)
-    parser.add_argument("--joint-epochs-per-outer", type=int, default=1)
-    parser.add_argument("--gibbs-sweeps-per-outer", type=int, default=5)
-    parser.add_argument("--mc-partitions", type=int, default=5)
-    parser.add_argument(
-        "--partition-initialization", choices=["latent_kmeans", "provided"],
-        default="latent_kmeans",
-        help="Use pretrained latent K-means or a supplied initial partition.",
-    )
-    parser.add_argument(
-        "--initial-partition-path", type=Path, default=None,
-        help="NPY cluster assignments used as the initial partition, separate from --y-path.",
-    )
-    parser.add_argument(
-        "--latent-scale-projection", action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Project pooled latent variance to one (linear architecture on CPU only).",
-    )
-    parser.add_argument(
-        "--partition-sampler",
-        choices=["independent_chains", "single_chain_sequential"],
-        default="single_chain_sequential",
-    )
-    parser.add_argument("--initial-chain-burnin-sweeps", type=int, default=0)
+    option("gibbs_sweeps_per_outer", type=int, help="B sweeps per joint iteration.")
+    option("mc_partitions", type=int, help="M retained states; the sequential chain retains sweeps B-M+1 through B.")
+    option("partition_initialization", choices=["latent_kmeans", "provided"],
+           help="Calibration/Gibbs partition source, unless overridden after warmup.")
+    option("initial_partition_path", type=Path,
+           help="Provided NPY partition, not reference labels. Required for early calibration under the provided policy.")
+    option("postwarm_partition_initialization", choices=["unchanged", "latent_hartigan"],
+           help="Override the Gibbs start with final latent Hartigan--Wong; also used for after-warmup calibration.")
+    option("latent_scale_projection", action=argparse.BooleanOptionalAction,
+           help="Project pooled latent variance to one (linear architecture, CPU only).")
+    option("partition_sampler", choices=["independent_chains", "single_chain_sequential"])
+    option("posterior_burnin_sweeps", type=int,
+           help="Extra final-stage burn-in; continue the last training-chain state.")
+    option("posterior_summary", choices=["salso", "vi_medoid", "dahl"])
+    option("psm_mode", choices=["auto", "full", "none"],
+           help="Save the co-clustering matrix; auto skips n above psm-max-n.")
 
-    parser.add_argument("--posterior-burnin-sweeps", type=int, default=100)
-    parser.add_argument("--posterior-samples", type=int, default=100)
-    parser.add_argument("--posterior-thinning", type=int, default=1)
-    parser.add_argument(
-        "--posterior-summary", choices=["salso", "vi_medoid", "dahl"], default="salso",
-        help="Partition summary: SALSO VI search, VI medoid, or Dahl criterion.",
-    )
-    parser.add_argument("--salso-n-runs", type=int, default=64)
-    parser.add_argument("--salso-n-cores", type=int, default=1)
-    parser.add_argument(
-        "--psm-mode",
-        choices=["auto", "full", "none"],
-        default="auto",
-        help=(
-            "Write the full n-by-n co-clustering matrix always, never, or only "
-            "when n does not exceed --psm-max-n."
-        ),
-    )
-    parser.add_argument("--psm-max-n", type=int, default=2500)
-
-    parser.add_argument(
-        "--target-gradient-ratio",
-        type=float,
-        default=1.0,
-        help="r0 in median(lambda_R ||grad R|| / ||grad C||) = r0.",
-    )
-    parser.add_argument("--gradient-epsilon", type=float, default=1e-12)
-    parser.add_argument("--calibration-batches", type=int, default=None)
-    parser.add_argument(
-        "--lambda-calibration-stage",
-        choices=["before_warmup", "after_warmup"],
-        default="after_warmup",
-    )
-    parser.add_argument(
-        "--eta-initialization",
-        choices=["prior_mean", "pretrained_loss"],
-        default="pretrained_loss",
-    )
-    parser.add_argument("--eta-a", type=float, default=1.0)
-    parser.add_argument("--eta-b", type=float, default=1.0)
-    parser.add_argument(
-        "--eta-shape-scale",
-        type=float,
-        default=1.0,
-        help=(
-            "Positive C in Gamma shape eta_a + C * n * (p + d) / 2; "
-            "rate unchanged. C != 1 is a sensitivity variant."
-        ),
-    )
-    parser.add_argument(
-        "--eta-multiplier",
-        type=float,
-        default=1.0,
-        help=(
-            "Use this multiplier times the base Gamma mean for Gibbs and neural "
-            "updates, including final sampling. The base Gamma update is unchanged; "
-            "non-unit values are an algorithmic sensitivity variant."
-        ),
-    )
-    parser.add_argument(
-        "--optimizer", choices=["sgd", "adam"], default="adam",
-        help=(
-            "Neural optimizer. SGD uses no momentum and requires both learning rates."
-        ),
-    )
-    for option, default_rate in (("--lr-pretrain", 5e-4), ("--lr-joint", 2e-4)):
-        parser.add_argument(
-            option, type=float, default=default_rate,
-            help=(
-                "Adam learning rate. For SGD, supply both rates through the CLI or preset."
-            ),
-        )
-    parser.add_argument("--encoder-prior-precision", type=float, default=1e-4)
-    parser.add_argument("--decoder-prior-precision", type=float, default=1e-4)
-    parser.add_argument("--standardize", choices=["none", "zscore"], default="none")
-    parser.add_argument("--seed", type=int, default=125)
-    parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--num-workers", type=int, default=0)
+    option("target_gradient_ratio", type=float, help="r0: target weighted reconstruction/clustering gradient ratio.")
+    option("lambda_calibration_stage", choices=["before_warmup", "after_warmup"],
+           help="Used only when lambda-calibration-epoch is unset.")
+    option("lambda_calibration_epoch", type=int,
+           help="Calibrate once after t warmup epochs (default: 10), 0<=t<=T. This is not the total warmup length; t=0 precedes warmup. A null preset value follows the stage.")
+    option("eta_initialization", choices=["pretrained_loss", "zero_loss"],
+           help="Use actual pretrained loss, or the experimental zero-loss Gamma initialization.")
+    option("eta_shape_scale", type=float, help="C in a_eta + C*n*(p+d)/2; non-unit values are sensitivity variants.")
+    option("eta_multiplier", type=float, help="Sensitivity multiplier applied to eta for Gibbs and neural updates.")
+    option("optimizer", choices=["sgd", "adam"], help="SGD requires both learning rates to be explicitly supplied.")
+    option("standardize", choices=["none", "zscore"])
+    option("device", type=str)
+    option("save_diagnostics", action="store_true", help="Save intermediate checkpoints and detailed diagnostics.")
     parser.add_argument(
         "--num-threads", type=int, default=1,
         help="CPU numerical-library threads (default: one for reproducible runs).",
-    )
-    parser.add_argument(
-        "--save-diagnostics", action="store_true",
-        help="Also save intermediate checkpoints, chain histories and detailed manifests.",
     )
     parser.add_argument("--quiet", action="store_true")
     return parser
@@ -239,56 +151,9 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         raise SystemExit(
             f"Refusing to write into an existing output directory: {output_dir}"
         )
-    config = TrainConfig(
-        x_path=args.x_path,
-        y_path=args.y_path,
-        output_dir=output_dir,
-        n_clusters=args.n_clusters,
-        z_dim=args.z_dim,
-        hidden_dim=args.hidden_dim,
-        hidden_dims=args.hidden_dims,
-        dropout=args.dropout,
-        architecture=args.architecture,
-        batch_size=args.batch_size,
-        pretrain_epochs=args.pretrain_epochs,
-        outer_iterations=args.outer_iterations,
-        joint_epochs_per_outer=args.joint_epochs_per_outer,
-        gibbs_sweeps_per_outer=args.gibbs_sweeps_per_outer,
-        mc_partitions=args.mc_partitions,
-        partition_initialization=args.partition_initialization,
-        initial_partition_path=args.initial_partition_path,
-        latent_scale_projection=args.latent_scale_projection,
-        partition_sampler=args.partition_sampler,
-        initial_chain_burnin_sweeps=args.initial_chain_burnin_sweeps,
-        posterior_burnin_sweeps=args.posterior_burnin_sweeps,
-        posterior_samples=args.posterior_samples,
-        posterior_thinning=args.posterior_thinning,
-        posterior_summary=args.posterior_summary,
-        salso_n_runs=args.salso_n_runs,
-        salso_n_cores=args.salso_n_cores,
-        psm_mode=args.psm_mode,
-        psm_max_n=args.psm_max_n,
-        target_gradient_ratio=args.target_gradient_ratio,
-        gradient_epsilon=args.gradient_epsilon,
-        calibration_batches=args.calibration_batches,
-        lambda_calibration_stage=args.lambda_calibration_stage,
-        eta_initialization=args.eta_initialization,
-        eta_a=args.eta_a,
-        eta_b=args.eta_b,
-        eta_shape_scale=args.eta_shape_scale,
-        eta_multiplier=args.eta_multiplier,
-        optimizer=args.optimizer,
-        lr_pretrain=args.lr_pretrain,
-        lr_joint=args.lr_joint,
-        encoder_prior_precision=args.encoder_prior_precision,
-        decoder_prior_precision=args.decoder_prior_precision,
-        standardize=args.standardize,
-        seed=args.seed,
-        device=args.device,
-        num_workers=args.num_workers,
-        verbose=not args.quiet,
-        save_diagnostics=args.save_diagnostics,
-    )
+    values = {field.name: getattr(args, field.name) for field in fields(TrainConfig)
+              if field.name not in {"output_dir", "verbose"}}
+    config = TrainConfig(**values, output_dir=output_dir, verbose=not args.quiet)
     config.validate()
     dataset, metadata = load_npy_dataset(
         config.x_path, config.y_path, standardize=config.standardize

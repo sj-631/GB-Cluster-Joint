@@ -36,6 +36,9 @@ venv/
 .idea/
 .vscode/
 .DS_Store
+.Rhistory
+.RData
+.Rproj.user/
 # Credentials and local settings
 .env
 .env.*

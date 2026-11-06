@@ -75,13 +75,6 @@ def empirical_expected_vi(candidate: np.ndarray, samples: np.ndarray) -> float:
 def vi_medoid_representative_partition(
     samples: np.ndarray,
 ) -> tuple[np.ndarray, int, float]:
-    """Minimize empirical expected VI over the retained fixed-K draws.
-
-    The representative is selected by an exact all-pairs comparison.
-    Relabeling and marginal entropies are cached once per draw, and each joint
-    contingency table is formed with ``bincount``.  This avoids repeatedly
-    sorting length-n label vectors and requires no n-by-n allocation.
-    """
     samples = np.asarray(samples)
     if samples.ndim != 2 or samples.shape[0] < 1:
         raise ValueError("samples must have shape (S, n) with S >= 1.")

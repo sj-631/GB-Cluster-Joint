@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import copy
 import csv
+import json
 import platform
 import random
+import shutil
+import subprocess
 import sys
 import time
 from dataclasses import asdict
@@ -52,18 +56,31 @@ from .utils import choose_device, data_manifest, save_json, set_seed, sha256_fil
 
 
 class TotalLossTrainer:
-    """Fit the autoencoder and partition distribution by Monte Carlo updates.
+    """Fit ``L = lambda_R * R_SSE + C_SSE`` by Monte Carlo coordinate updates.
 
-    The implementation uses ``L = lambda_R * R_SSE + C_SSE`` throughout.
-    Each neural minibatch uses full-data centroids at the current network
-    parameters. Their derivative cancels in the full profiled SSE, so detaching
-    current means gives an unbiased minibatch gradient without stale centres.
-    Network weights are point estimates (the manuscript's small-epsilon
-    plug-in approximation), not samples from a finite-variance weight posterior.
+    Network weights use the manuscript's point-estimate approximation. Each
+    minibatch uses current full-data centroids; their derivative cancels in the
+    full profiled SSE, allowing detached means without stale-centroid gradients.
     """
 
     @staticmethod
     def validate_runtime_dependencies(config: TrainConfig) -> dict:
+        if config.postwarm_partition_initialization == "latent_hartigan":
+            rscript = shutil.which("Rscript")
+            if rscript is None:
+                raise RuntimeError(
+                    "Latent Hartigan--Wong requires Rscript and the R packages "
+                    "RcppCNPy, jsonlite, and digest; no fallback initializer is used."
+                )
+            bridge = Path(__file__).resolve().parents[1] / "scripts" / "initialize_hartigan.R"
+            check = subprocess.run(
+                [rscript, "--vanilla", str(bridge), "--check"],
+                text=True, capture_output=True, timeout=30,
+            )
+            if check.returncode:
+                raise RuntimeError(
+                    "Hartigan--Wong dependency check failed:\n" + check.stdout + check.stderr
+                )
         if config.posterior_summary == "salso":
             script = Path(__file__).resolve().parents[1] / "scripts" / "salso_vi.R"
             return ensure_salso_available(script)
@@ -112,7 +129,9 @@ class TotalLossTrainer:
             "model_definition.json",
             {
                 "loss": "lambda_reconstruction * raw_R_SSE + raw_C_SSE",
-                "lambda_calibration_stage": config.lambda_calibration_stage,
+                "lambda_calibration_stage": config.resolved_lambda_calibration_stage,
+                "resolved_lambda_calibration_epoch": config.resolved_lambda_calibration_epoch,
+                "configured_lambda_calibration_stage": config.lambda_calibration_stage,
                 "eta_initialization": config.eta_initialization,
                 "lambda_calibration_target": (
                     "median(lambda_R * ||grad_encoder R|| / "
@@ -136,14 +155,23 @@ class TotalLossTrainer:
                 "partition_learning_rate": "none",
                 "latent_scale_projection": self._scale_definition(),
                 "architecture": config.architecture,
-                "architecture_topology": ARCHITECTURE_TOPOLOGIES[
-                    config.architecture
-                ],
+                "architecture_topology": ARCHITECTURE_TOPOLOGIES[config.architecture],
                 "centroid_refresh": "full data, current network, before every neural minibatch",
                 "network_approximation": "point-estimate plug-in; no finite-epsilon weight sampling",
                 "optimizer": config.optimizer,
                 "stopping_rule": "fixed outer_iterations budget, not a convergence guarantee",
-                "initialization": config.partition_initialization,
+                "initialization": (
+                    config.partition_initialization
+                    if config.postwarm_partition_initialization == "unchanged"
+                    else config.postwarm_partition_initialization
+                ),
+                "calibration_partition_initialization": (
+                    config.postwarm_partition_initialization
+                    if config.resolved_lambda_calibration_stage == "after_warmup"
+                    and config.postwarm_partition_initialization != "unchanged"
+                    else config.partition_initialization
+                ),
+                "postwarm_partition_initialization": config.postwarm_partition_initialization,
                 "initial_partition_path": config.to_dict()["initial_partition_path"],
                 "n_chains": config.n_chains,
                 "gibbs_sweeps_B": config.gibbs_sweeps_per_outer,
@@ -152,20 +180,13 @@ class TotalLossTrainer:
             },
         )
 
-        self.train_loader = DataLoader(
-            dataset,
-            batch_size=config.batch_size,
-            shuffle=True,
-            drop_last=False,
-            num_workers=config.num_workers,
-        )
-        self.eval_loader = DataLoader(
-            dataset,
-            batch_size=config.batch_size,
-            shuffle=False,
-            drop_last=False,
-            num_workers=config.num_workers,
-        )
+        loader_options = {
+            "batch_size": config.batch_size,
+            "drop_last": False,
+            "num_workers": config.num_workers,
+        }
+        self.train_loader = DataLoader(dataset, shuffle=True, **loader_options)
+        self.eval_loader = DataLoader(dataset, shuffle=False, **loader_options)
         self.model = MLPAutoEncoder(
             input_dim=int(dataset.x.shape[1]),
             z_dim=config.z_dim,
@@ -187,6 +208,8 @@ class TotalLossTrainer:
         self.pretrain_metrics: Dict[str, float] = {}
         self.centroid_refresh_count = 0
         self.pretrain_gradient_steps = 0
+        self.pretrain_epochs_completed = 0
+        self.lambda_calibration_result: dict[str, object] | None = None
         self.joint_gradient_steps = 0
         self.scale_history: list[dict[str, object]] = []
         self.initial_partition_metrics: Dict[str, float] = {}
@@ -195,13 +218,11 @@ class TotalLossTrainer:
         self.chain_seeds: List[int] = []
         for chain_index in range(config.n_chains):
             generator = torch.Generator(device="cpu")
-            # Use a separate, reproducible seed for each chain.
             chain_seed = config.seed + 104729 * (chain_index + 1)
             generator.manual_seed(chain_seed)
             self.chain_seeds.append(chain_seed)
             self.chain_generators.append(generator)
-        # Loading a supplied partition consumes no model or chain randomness.
-        # External reference labels (dataset.y) are never used to initialize.
+        # Supplied partitions use neither reference labels nor training RNGs.
         self.provided_initial_labels: torch.Tensor | None = None
         self.initialization_manifest: dict[str, object] = {
             "method": config.partition_initialization,
@@ -209,10 +230,24 @@ class TotalLossTrainer:
             "n_chains": config.n_chains,
             "latent_kmeans_diagnostic_is_actual_initialization": (
                 config.partition_initialization == "latent_kmeans"
+                and config.postwarm_partition_initialization == "unchanged"
             ),
         }
         if config.partition_initialization == "provided":
-            self._load_provided_initial_partition()
+            if config.initial_partition_path is not None:
+                self._load_provided_initial_partition()
+            else:
+                # Validation requires Hartigan--Wong to supply calibration and Gibbs.
+                self.initialization_manifest.update({
+                    "path": None,
+                    "provided_partition_loaded": False,
+                    "provided_partition_role": (
+                        "not supplied; unused because final pretrained latent "
+                        "Hartigan--Wong supplies calibration and Gibbs initialization"
+                    ),
+                })
+        if config.postwarm_partition_initialization == "latent_hartigan":
+            self.initialization_manifest["pending_postwarm_override"] = "latent_hartigan"
         save_json(self.output_dir / "initial_partition_manifest.json", self.initialization_manifest)
 
     def _load_provided_initial_partition(self) -> None:
@@ -235,6 +270,7 @@ class TotalLossTrainer:
         self.provided_initial_labels = torch.from_numpy(normalized.copy())
         self.initialization_manifest.update({
             "path": str(path),
+            "provided_partition_loaded": True,
             "sha256": sha256_file(path),
             "input_dtype": str(labels.dtype),
             "original_label_values": values.tolist(),
@@ -280,20 +316,37 @@ class TotalLossTrainer:
         """Record settings that differ from the Algorithm 1 reference values."""
         variants = []
         for key, reference in (
-            ("lambda_calibration_stage", "after_warmup"),
             ("eta_initialization", "pretrained_loss"),
             ("partition_sampler", "single_chain_sequential"),
             ("posterior_summary", "salso"),
-            ("optimizer", "sgd"),
+            ("optimizer", "adam"),
             ("eta_shape_scale", 1.0),
             ("eta_multiplier", 1.0),
             ("initial_chain_burnin_sweeps", 0),
             ("partition_initialization", "latent_kmeans"),
         ):
             if getattr(self.config, key) != reference:
+                if key == "partition_initialization" and self.config.postwarm_partition_initialization == "latent_hartigan":
+                    if self.config.resolved_lambda_calibration_stage != "after_warmup":
+                        variants.append(
+                            "early calibration partition source="
+                            f"{self.config.partition_initialization}; actual Gibbs start is latent Hartigan--Wong"
+                        )
+                    continue
                 variants.append(f"{key}={getattr(self.config, key)} (reference: {reference})")
+        if self.config.resolved_lambda_calibration_stage != "after_warmup":
+            variants.append(
+                f"lambda calibration after {self.config.resolved_lambda_calibration_epoch} "
+                f"of {self.config.pretrain_epochs} warmup epochs "
+                "(reference: after complete warmup)"
+            )
         if self.config.latent_scale_projection:
             variants.append("latent pooled centered variance projected to 1 after warmup and each joint epoch")
+        if self.config.postwarm_partition_initialization == "latent_hartigan":
+            variants.append(
+                "actual Gibbs start: Hartigan--Wong K-means on final pretrained latent; "
+                f"nstart={self.config.hartigan_n_starts}"
+            )
         return variants
 
     def _log(self, message: str) -> None:
@@ -332,6 +385,8 @@ class TotalLossTrainer:
     ) -> None:
         if config.n_clusters > len(dataset):
             raise ValueError("n_clusters cannot exceed the number of observations.")
+        if config.postwarm_partition_initialization == "latent_hartigan" and config.n_clusters >= len(dataset):
+            raise ValueError("Hartigan--Wong requires n_clusters < n_observations.")
         if config.architecture in {"dcec_conv", "mnist_conv"}:
             if int(dataset.x.shape[1]) != 28 * 28:
                 raise ValueError(
@@ -354,14 +409,7 @@ class TotalLossTrainer:
         }
 
     def _partition_ari_metrics(self, partitions: torch.Tensor) -> Dict[str, float]:
-        """Evaluate retained Gibbs states against the reference labels.
-
-        A joint iteration retains M states before its neural update. These
-        labels do not change during that update. The last-state ARI and the
-        mean across M states describe the training partitions, rather than
-        the final SALSO representative. This diagnostic does not affect fitting
-        or consume training random numbers.
-        """
+        """Evaluate training partitions, not SALSO; no fitting or RNG effects."""
         if self.dataset.y is None:
             return {}
         states = partitions.detach().cpu().numpy()
@@ -392,17 +440,13 @@ class TotalLossTrainer:
 
     def _initial_partitions(self) -> Tuple[torch.Tensor, torch.Tensor]:
         z = encode_full_dataset(self.model, self.eval_loader, self.device)
-        partitions = torch.stack(
-            [
-                initialize_labels_kmeans(
-                    z,
-                    n_clusters=self.config.n_clusters,
-                    seed=self.config.seed + 1009 * chain_index,
-                )
-                for chain_index in range(self.config.n_chains)
-            ],
-            dim=0,
-        )
+        partitions = torch.stack([
+            initialize_labels_kmeans(
+                z, n_clusters=self.config.n_clusters,
+                seed=self.config.seed + 1009 * chain_index,
+            )
+            for chain_index in range(self.config.n_chains)
+        ], dim=0)
         return partitions, z
 
     def _partition_means(
@@ -410,13 +454,10 @@ class TotalLossTrainer:
         z: torch.Tensor,
         partitions: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.stack(
-            [
-                compute_cluster_stats(z, labels, self.config.n_clusters)[0]
-                for labels in partitions
-            ],
-            dim=0,
-        )
+        return torch.stack([
+            compute_cluster_stats(z, labels, self.config.n_clusters)[0]
+            for labels in partitions
+        ], dim=0)
 
     def _mc_batch_cluster_sse(
         self,
@@ -426,13 +467,10 @@ class TotalLossTrainer:
         means: torch.Tensor,
     ) -> torch.Tensor:
         partitions_device = partitions.to(self.device)
-        targets = torch.stack(
-            [
-                means[m][partitions_device[m, indices]]
-                for m in range(partitions.shape[0])
-            ],
-            dim=0,
-        )
+        targets = torch.stack([
+            means[m][partitions_device[m, indices]]
+            for m in range(partitions.shape[0])
+        ], dim=0)
         # Raw sum over observations and latent coordinates, MC mean over q(c).
         return (z.unsqueeze(0) - targets).pow(2).flatten(start_dim=1).sum(dim=1).mean()
 
@@ -441,34 +479,68 @@ class TotalLossTrainer:
         value = torch.sqrt(sum(g.detach().pow(2).sum() for g in gradients))
         return float(value.item())
 
+    @staticmethod
+    def _rng_state() -> dict[str, object]:
+        return {
+            "python_rng": random.getstate(),
+            "numpy_rng": copy.deepcopy(np.random.get_state()),
+            "torch_rng": torch.get_rng_state().clone(),
+            "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }
+
+    @staticmethod
+    def _restore_rng_state(state: dict[str, object]) -> None:
+        random.setstate(state["python_rng"])
+        np.random.set_state(state["numpy_rng"])
+        torch.set_rng_state(state["torch_rng"])
+        if state["cuda_rng"] is not None:
+            torch.cuda.set_rng_state_all(state["cuda_rng"])
+
     def _calibrate_lambda(
         self, partitions: torch.Tensor | None = None
     ) -> dict[str, object]:
         """Calibrate lambda_R without changing training RNG or parameters."""
 
-        python_state = random.getstate()
-        numpy_state = np.random.get_state()
-        torch_state = torch.get_rng_state()
-        cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-        was_training = self.model.training
+        rng_state = self._rng_state()
+        module_modes = [(module, module.training) for module in self.model.modules()]
+        stage = self.config.resolved_lambda_calibration_stage
+        epoch = self.config.resolved_lambda_calibration_epoch
         try:
-            if self.config.save_diagnostics and self.config.lambda_calibration_stage == "before_warmup":
+            if self.config.save_diagnostics and stage != "after_warmup":
                 torch.save(self.model.state_dict(), self.output_dir / "model_state_calibration.pt")
+            uses_postwarm_hartigan = (
+                self.config.postwarm_partition_initialization == "latent_hartigan"
+                and stage == "after_warmup"
+            )
+            if uses_postwarm_hartigan and partitions is None:
+                raise ValueError("After-warmup calibration requires the actual latent Hartigan--Wong partition.")
             if partitions is None and self.config.partition_initialization == "provided":
                 partitions = self._provided_partitions()
             if partitions is None:
                 partitions, z_full = self._initial_partitions()
-                partition_source = "deterministic latent K-means states (pre-warmup variant)"
+                partition_source = (
+                    "deterministic latent K-means states (pre-warmup variant)"
+                    if stage == "before_warmup" else
+                    f"deterministic K-means on latent representation after warmup epoch {epoch}"
+                )
             else:
                 partitions = partitions.detach().clone().to(self.device)
                 z_full = encode_full_dataset(self.model, self.eval_loader, self.device)
                 partition_source = "actual pretrained latent K-means initial partition"
-            if self.config.partition_initialization == "provided":
-                partition_source = (
-                    "provided GB initial partition, evaluated in random initial latent space"
-                    if self.config.lambda_calibration_stage == "before_warmup" else
-                    "provided GB initial partition, evaluated in pretrained latent space"
+            if uses_postwarm_hartigan:
+                partition_source = "actual final pretrained latent Hartigan--Wong Gibbs initial partition"
+            elif self.config.partition_initialization == "provided":
+                feature_space = {
+                    "before_warmup": "random initial latent space",
+                    "during_warmup": f"latent space after warmup epoch {epoch}",
+                    "after_warmup": "pretrained latent space",
+                }[stage]
+                partition_role = (
+                    "provided calibration-only partition"
+                    if self.config.postwarm_partition_initialization == "latent_hartigan"
+                    else "provided GB initial partition"
                 )
+                partition_source = f"{partition_role}, evaluated in {feature_space}"
             means = self._partition_means(z_full, partitions).detach()
             encoder_parameters = tuple(self.model.encoder.parameters())
             ratios: List[float] = []
@@ -494,16 +566,12 @@ class TotalLossTrainer:
                     z, indices, partitions, means
                 )
                 gradients_r = torch.autograd.grad(
-                    reconstruction_total,
-                    encoder_parameters,
-                    retain_graph=True,
-                    allow_unused=False,
+                    reconstruction_total, encoder_parameters,
+                    retain_graph=True, allow_unused=False,
                 )
                 gradients_c = torch.autograd.grad(
-                    clustering_total,
-                    encoder_parameters,
-                    retain_graph=False,
-                    allow_unused=False,
+                    clustering_total, encoder_parameters,
+                    retain_graph=False, allow_unused=False,
                 )
                 norm_r = self._gradient_norm(gradients_r)
                 norm_c = self._gradient_norm(gradients_c)
@@ -526,19 +594,23 @@ class TotalLossTrainer:
                 target_gradient_ratio=self.config.target_gradient_ratio,
             )
             initial_labels = partitions.detach().cpu().numpy()
-            self._save_diagnostic_array(
-                ("persistent_partitions_random_initialization.npy"
-                 if self.config.lambda_calibration_stage == "before_warmup"
-                 else "calibration_partitions_pretrained.npy"),
-                initial_labels,
-            )
+            calibration_path = {
+                "before_warmup": "persistent_partitions_random_initialization.npy",
+                "during_warmup": f"calibration_partitions_epoch_{epoch}.npy",
+                "after_warmup": "calibration_partitions_pretrained.npy",
+            }[stage]
+            self._save_diagnostic_array(calibration_path, initial_labels)
             result: dict[str, object] = {
                 "weight_placement": "reconstruction",
-                "calibration_stage": (
-                    "random network initialization before warmup"
-                    if self.config.lambda_calibration_stage == "before_warmup"
-                    else "pretrained network after reconstruction warmup"
-                ),
+                "calibration_stage": {
+                    "before_warmup": "random network initialization before warmup",
+                    "during_warmup": f"network after reconstruction warmup epoch {epoch}",
+                    "after_warmup": "pretrained network after reconstruction warmup",
+                }[stage],
+                "resolved_lambda_calibration_stage": stage,
+                "resolved_lambda_calibration_epoch": epoch,
+                "pretrain_epochs_completed": self.pretrain_epochs_completed,
+                "pretrain_gradient_steps": self.pretrain_gradient_steps,
                 "partition_initialization": partition_source,
                 "partition_states": int(partitions.shape[0]),
                 "calibration_batches": len(ratios),
@@ -557,26 +629,45 @@ class TotalLossTrainer:
                 "achieved_weighted_ratio": float(
                     self.lambda_reconstruction * np.median(ratios)
                 ),
-                "reconstruction_gradient_norm_median": float(
-                    np.median(reconstruction_norms)
-                ),
+                "reconstruction_gradient_norm_median": float(np.median(reconstruction_norms)),
                 "clustering_gradient_norm_median": float(np.median(clustering_norms)),
                 "gradient_cosine_median": float(np.median(cosines)),
                 "raw_gradient_ratios": ratios,
                 "rng_state_restored_after_calibration": True,
             }
-            if self.config.partition_initialization == "provided":
+            if self.config.partition_initialization == "provided" or uses_postwarm_hartigan:
                 result["initial_labels_sha256"] = self.initialization_manifest["sha256"]
                 result["no_precalibration_scale_projection"] = not self.scale_history
             self._save_diagnostic_json("lambda_reconstruction_calibration.json", result)
             return result
         finally:
-            random.setstate(python_state)
-            np.random.set_state(numpy_state)
-            torch.set_rng_state(torch_state)
-            if cuda_states is not None:
-                torch.cuda.set_rng_state_all(cuda_states)
-            self.model.train(was_training)
+            self._restore_rng_state(rng_state)
+            for module, training in module_modes:
+                module.training = training
+
+    def _run_lambda_calibration(
+        self, partitions: torch.Tensor | None = None
+    ) -> dict[str, object]:
+        """Run the single scheduled calibration without training the network."""
+        if self.lambda_calibration_result is not None:
+            raise RuntimeError("Lambda has already been calibrated for this run.")
+        epoch = self.config.resolved_lambda_calibration_epoch
+        if self.pretrain_epochs_completed != epoch:
+            raise RuntimeError("Lambda calibration was requested at the wrong warmup epoch.")
+        self._log(
+            f"[Calibration] after {epoch}/{self.config.pretrain_epochs} pretraining epochs "
+            f"| stage={self.config.resolved_lambda_calibration_stage}"
+        )
+        result = (
+            self._calibrate_lambda() if partitions is None
+            else self._calibrate_lambda(partitions)
+        )
+        self.lambda_calibration_result = result
+        self._log(
+            f"[Calibration complete] lambda_R={self.lambda_reconstruction:.8g} "
+            f"| r0={self.config.target_gradient_ratio:.8g}; fixed thereafter"
+        )
+        return result
 
     def _train_reconstruction_epoch(self) -> float:
         self.model.train()
@@ -606,11 +697,17 @@ class TotalLossTrainer:
         for epoch in range(self.config.pretrain_epochs):
             epoch_start = time.perf_counter()
             loss = self._train_reconstruction_epoch()
+            self.pretrain_epochs_completed = epoch + 1
             self._log(
                 f"[Pretrain {epoch + 1}/{self.config.pretrain_epochs}] "
                 f"objective={loss:.6g} (R only) | "
                 f"time={time.perf_counter() - epoch_start:.1f}s"
             )
+            if (
+                self.config.resolved_lambda_calibration_stage == "during_warmup"
+                and self.pretrain_epochs_completed == self.config.resolved_lambda_calibration_epoch
+            ):
+                self._run_lambda_calibration()
         if self.config.save_diagnostics:
             checkpoint_name = (
                 "model_state_pretrained_before_scale.pt"
@@ -619,31 +716,25 @@ class TotalLossTrainer:
             torch.save(self.model.state_dict(), self.output_dir / checkpoint_name)
         partitions, z = self._initial_partitions()
         if self.config.partition_sampler == "single_chain_sequential":
-            # One latent K-means start, also used for calibration and eta.
+            # Keep the diagnostic; provided/Hartigan labels may replace the Gibbs start.
             partitions = partitions[:1]
         self._save_diagnostic_array(
             "latent_pretrained_before_scale.npy"
             if self.config.latent_scale_projection else "latent_pretrained.npy",
             z.cpu().numpy(),
         )
-        self._save_diagnostic_array(
-            "persistent_partitions_pretrained.npy",
-            partitions.cpu().numpy(),
-        )
-        self._save_diagnostic_array(
-            "labels_kmeans_pretrained.npy",
-            partitions[0].cpu().numpy(),
-        )
+        self._save_diagnostic_array("persistent_partitions_pretrained.npy", partitions.cpu().numpy())
+        self._save_diagnostic_array("labels_kmeans_pretrained.npy", partitions[0].cpu().numpy())
         self.pretrain_metrics = self._metrics(partitions[0])
-        self._save_diagnostic_json(
-            "metrics_kmeans_pretrained.json", self.pretrain_metrics,
-        )
+        self._save_diagnostic_json("metrics_kmeans_pretrained.json", self.pretrain_metrics)
         self._log("[Pretrain complete] " + " | ".join(
             f"{name.upper()}={value:.4f}" for name, value in self.pretrain_metrics.items()
         ))
-        # Compute the K-means diagnostic for both initialization modes to keep
-        # forward-pass order and RNG use consistent.
-        if self.config.partition_initialization == "provided":
+        # Always compute K-means above to preserve forward-pass/RNG order.
+        if (
+            self.config.partition_initialization == "provided"
+            and self.provided_initial_labels is not None
+        ):
             partitions = self._provided_partitions()
         self.initial_partition_metrics = self._metrics(partitions[0])
         self.initialization_manifest.update({
@@ -663,6 +754,172 @@ class TotalLossTrainer:
                 f"[Scale after warmup] variance={projection['variance_before']:.8g}"
                 f" -> {projection['variance_after']:.8g}; factor={projection['scale_factor']:.8g}"
             )
+        if self.config.postwarm_partition_initialization == "latent_hartigan":
+            partitions = self._initialize_postwarm_hartigan(z)
+        return partitions
+
+    @staticmethod
+    def _state_equal(first: object, second: object) -> bool:
+        """Exact recursive comparison for the initialization non-mutation audit."""
+        if isinstance(first, torch.Tensor):
+            return isinstance(second, torch.Tensor) and torch.equal(first, second)
+        if isinstance(first, np.ndarray):
+            return isinstance(second, np.ndarray) and np.array_equal(first, second)
+        if isinstance(first, dict):
+            return (
+                isinstance(second, dict) and first.keys() == second.keys()
+                and all(TotalLossTrainer._state_equal(value, second[key]) for key, value in first.items())
+            )
+        if isinstance(first, (list, tuple)):
+            return (
+                type(first) is type(second) and len(first) == len(second)
+                and all(TotalLossTrainer._state_equal(a, b) for a, b in zip(first, second))
+            )
+        return type(first) is type(second) and first == second
+
+    def _calibration_audit_snapshot(self) -> dict[str, object]:
+        """Capture training state without advancing any RNG or network forward."""
+        return {
+            "model_state": copy.deepcopy(self.model.state_dict()),
+            "pretrain_optimizer": copy.deepcopy(self.pretrain_optimizer.state_dict()),
+            "joint_optimizer": copy.deepcopy(self.joint_optimizer.state_dict()),
+            "parameter_gradients": [
+                None if parameter.grad is None else parameter.grad.detach().clone()
+                for parameter in self.model.parameters()
+            ],
+            "module_training_modes": [module.training for module in self.model.modules()],
+            **self._rng_state(),
+            "chain_rngs": [generator.get_state().clone() for generator in self.chain_generators],
+            "pretrain_gradient_steps": self.pretrain_gradient_steps,
+            "joint_gradient_steps": self.joint_gradient_steps,
+            "scale_history": copy.deepcopy(self.scale_history),
+        }
+
+    def _initialize_postwarm_hartigan(self, z: torch.Tensor) -> torch.Tensor:
+        """Initialize from final pretrained ``z`` without another network forward.
+
+        The subprocess must preserve optimizer/RNG state and any earlier calibration.
+        """
+        before = self._calibration_audit_snapshot()
+        lambda_before = self.lambda_reconstruction
+        earlier_manifest = copy.deepcopy(self.initialization_manifest)
+        earlier_manifest.pop("pending_postwarm_override", None)
+        calibration_stage = self.config.resolved_lambda_calibration_stage
+        calibration_epoch = self.config.resolved_lambda_calibration_epoch
+        calibration_early = calibration_stage != "after_warmup"
+        earlier_manifest["stage"] = (
+            "earlier calibration partition source; not the actual Gibbs start"
+            if calibration_early else
+            "superseded partition source; not used for after-warmup calibration or Gibbs"
+        )
+        input_path = self.output_dir / "latent_hartigan_input.npy"
+        result_dir = self.output_dir / "postwarm_hartigan"
+        if input_path.exists() or result_dir.exists():
+            raise FileExistsError("Refusing to overwrite post-warmup Hartigan--Wong inputs/results.")
+        np.save(input_path, z.detach().cpu().numpy(), allow_pickle=False)
+        script = Path(__file__).resolve().parents[1] / "scripts" / "initialize_hartigan.py"
+        command = [
+            sys.executable, str(script), "--x-path", str(input_path),
+            "--output-dir", str(result_dir), "--n-clusters", str(self.config.n_clusters),
+            "--seed", str(self.config.seed), "--n-starts", str(self.config.hartigan_n_starts),
+            "--max-iterations", "1000", "--standardize", "none",
+        ]
+        self._log(
+            f"[Postwarm Hartigan-Wong] final pretrained latent; "
+            f"nstart={self.config.hartigan_n_starts}; seed={self.config.seed}"
+        )
+        fitted = subprocess.run(
+            command, text=True, capture_output=True, check=False, timeout=1860,
+        )
+        if fitted.returncode:
+            raise RuntimeError("Postwarm Hartigan--Wong failed:\n" + fitted.stdout + fitted.stderr)
+        labels_path = result_dir / "labels.npy"
+        labels = np.load(labels_path, allow_pickle=False)
+        if (
+            labels.shape != (len(self.dataset),)
+            or not np.issubdtype(labels.dtype, np.integer)
+            or not np.array_equal(np.unique(labels), np.arange(self.config.n_clusters))
+        ):
+            raise RuntimeError("Postwarm Hartigan--Wong returned invalid labels.")
+        result = json.loads((result_dir / "result.json").read_text(encoding="utf-8"))
+        partitions = torch.from_numpy(labels.astype(np.int64, copy=True)).to(self.device)
+        partitions = partitions.unsqueeze(0).repeat(self.config.n_chains, 1)
+        after = self._calibration_audit_snapshot()
+        checks = {
+            key + "_unchanged": self._state_equal(value, after[key])
+            for key, value in before.items()
+        }
+        checks["lambda_reconstruction_unchanged"] = bool(
+            self.lambda_reconstruction == lambda_before
+            or (np.isnan(self.lambda_reconstruction) and np.isnan(lambda_before))
+        )
+        audit = {
+            "all_checks_passed": all(checks.values()), "checks": checks,
+            "pretrain_gradient_steps": self.pretrain_gradient_steps,
+            "scale_projection_count": len(self.scale_history),
+            "input_is_final_pretrained_latent": True,
+            "extra_network_forward_passes": 0,
+            "hartigan_in_separate_process": True,
+        }
+        save_json(self.output_dir / "postwarm_hartigan_state_audit.json", audit)
+        if not audit["all_checks_passed"]:
+            raise RuntimeError(f"Postwarm Hartigan--Wong modified training state: {checks}")
+        self.initial_partition_metrics = self._metrics(partitions[0])
+        self.initialization_manifest = {
+            "method": "latent_hartigan", "algorithm": "Hartigan-Wong",
+            "feature_space": "final pretrained latent representation",
+            "stage": "after full reconstruction warmup and optional scale projection; before after-warmup calibration, initial eta and first Gibbs sweep",
+            "path": str(labels_path), "sha256": sha256_file(labels_path),
+            "latent_input_path": str(input_path), "latent_input_sha256": sha256_file(input_path),
+            "seed": self.config.seed, "nstart": self.config.hartigan_n_starts,
+            "iter_max": 1000, "n_chains": self.config.n_chains,
+            "cluster_sizes": np.bincount(labels.astype(np.int64)).tolist(),
+            "reference_labels_used_for_initialization": False,
+            "latent_kmeans_diagnostic_is_actual_initialization": False,
+            "configured_partition_initialization": self.config.partition_initialization,
+            "provided_partition_loaded": self.provided_initial_labels is not None,
+            "provided_partition_role": (
+                "no supplied partition"
+                if self.config.partition_initialization != "provided" else
+                "not supplied; not needed for after-warmup calibration or Gibbs initialization"
+                if self.provided_initial_labels is None else
+                "lambda calibration only; not the initial Gibbs partition"
+                if calibration_early else
+                "not used for calibration or Gibbs initialization"
+            ),
+            "calibration_partition": (
+                (earlier_manifest if self.config.partition_initialization == "provided" else {
+                    "method": "latent_kmeans",
+                    "feature_space": (
+                        "random network latent representation before warmup"
+                        if calibration_stage == "before_warmup" else
+                        f"latent representation after warmup epoch {calibration_epoch}"
+                    ),
+                    "stage": (
+                        "before warmup; distinct from the final pretrained latent diagnostic"
+                        if calibration_stage == "before_warmup" else
+                        f"after warmup epoch {calibration_epoch}; not the final Gibbs partition"
+                    ),
+                    "reference_labels_used_for_initialization": False,
+                }) if calibration_early else {
+                    "method": "latent_hartigan", "path": str(labels_path),
+                    "sha256": sha256_file(labels_path),
+                    "stage": "after warmup; same partition as the Gibbs start",
+                }
+            ),
+            "resolved_lambda_calibration_epoch": calibration_epoch,
+            "resolved_lambda_calibration_stage": calibration_stage,
+            "selection": "lowest latent within-cluster SSE across R Hartigan--Wong starts; no reference labels",
+            "metrics": self.initial_partition_metrics,
+            "metrics_role": "post-initialization evaluation only; not used to select labels",
+            "hartigan_result": result, "non_mutation_audit": audit,
+        }
+        save_json(self.output_dir / "initial_partition_manifest.json", self.initialization_manifest)
+        self._save_diagnostic_array("persistent_partitions_gibbs_initial.npy", partitions.cpu().numpy())
+        self._save_diagnostic_json("metrics_hartigan_pretrained.json", self.initial_partition_metrics)
+        self._log("[Postwarm Hartigan-Wong complete] " + " | ".join(
+            f"{name.upper()}={value:.4f}" for name, value in self.initial_partition_metrics.items()
+        ) + "; no model, optimizer or RNG changes")
         return partitions
 
     @torch.no_grad()
@@ -674,6 +931,18 @@ class TotalLossTrainer:
             total += float((self.model(x) - x).pow(2).sum().item())
         return total
 
+    def _eta_from_losses(self, reconstruction_sse: float, cluster_sse: float) -> EtaPosterior:
+        """Use the same Gamma parameterization for initialization and every update."""
+        return update_eta_posterior(
+            n=len(self.dataset), p=int(self.dataset.x.shape[1]), d=self.config.z_dim,
+            eta_a=self.config.eta_a, eta_b=self.config.eta_b,
+            eta_shape_scale=self.config.eta_shape_scale,
+            eta_multiplier=self.config.eta_multiplier,
+            lambda_reconstruction=self.lambda_reconstruction,
+            full_reconstruction_sse=reconstruction_sse,
+            expected_cluster_sse=cluster_sse,
+        )
+
     @torch.no_grad()
     def _evaluate_total_loss(
         self,
@@ -682,56 +951,27 @@ class TotalLossTrainer:
         z = encode_full_dataset(self.model, self.eval_loader, self.device)
         sses = compute_partition_sses(z, partitions.to(self.device), self.config.n_clusters)
         reconstruction_sse = self._full_reconstruction_sse()
-        eta = update_eta_posterior(
-            n=len(self.dataset),
-            p=int(self.dataset.x.shape[1]),
-            d=self.config.z_dim,
-            eta_a=self.config.eta_a,
-            eta_b=self.config.eta_b,
-            eta_shape_scale=self.config.eta_shape_scale,
-            eta_multiplier=self.config.eta_multiplier,
-            lambda_reconstruction=self.lambda_reconstruction,
-            full_reconstruction_sse=reconstruction_sse,
-            expected_cluster_sse=float(sses.mean().item()),
-        )
+        eta = self._eta_from_losses(reconstruction_sse, float(sses.mean().item()))
         return eta, z, sses, reconstruction_sse
 
     def _initialize_eta(self, partitions: torch.Tensor) -> EtaPosterior:
         """Choose only the starting q(eta), without advancing training RNGs."""
 
-        python_state = random.getstate()
-        numpy_state = np.random.get_state()
-        torch_state = torch.get_rng_state()
-        cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        rng_state = self._rng_state()
         was_training = self.model.training
         try:
             if self.config.eta_initialization == "pretrained_loss":
                 eta, _, _, _ = self._evaluate_total_loss(partitions)
                 source = "actual pretrained reconstruction and initial-partition losses"
             else:
-                eta = update_eta_posterior(
-                    n=len(self.dataset),
-                    p=int(self.dataset.x.shape[1]),
-                    d=self.config.z_dim,
-                    eta_a=self.config.eta_a,
-                    eta_b=self.config.eta_b,
-                    eta_shape_scale=self.config.eta_shape_scale,
-                    eta_multiplier=self.config.eta_multiplier,
-                    lambda_reconstruction=self.lambda_reconstruction,
-                    full_reconstruction_sse=0.0,
-                    expected_cluster_sse=0.0,
-                )
+                eta = self._eta_from_losses(0.0, 0.0)
                 source = "zero-loss extended-Gamma initialization (non-manuscript variant)"
             self._save_diagnostic_json(
                 "eta_initialization.json", {"source": source, **asdict(eta)}
             )
             return eta
         finally:
-            random.setstate(python_state)
-            np.random.set_state(numpy_state)
-            torch.set_rng_state(torch_state)
-            if cuda_states is not None:
-                torch.cuda.set_rng_state_all(cuda_states)
+            self._restore_rng_state(rng_state)
             self.model.train(was_training)
 
     def _advance_partitions(
@@ -741,30 +981,39 @@ class TotalLossTrainer:
         *,
         eta_mean: float,
         sweeps: int,
+        retain_count: int | None = None,
     ) -> torch.Tensor:
-        """Advance allocations at an already scaled effective eta; R cancels."""
+        """Advance at effective eta, retaining the last M single-chain sweeps.
+
+        Burn-in overrides M with one; independent chains keep one final state each.
+        """
+
+        if not isinstance(sweeps, int) or isinstance(sweeps, bool) or sweeps < 1:
+            raise ValueError("sweeps must be a positive integer.")
+        retained = self.config.mc_partitions if retain_count is None else retain_count
+        if not isinstance(retained, int) or isinstance(retained, bool) or retained < 1:
+            raise ValueError("retain_count must be a positive integer.")
 
         return_device = partitions.device
         z_cpu = z.detach().cpu()
         states = partitions.detach().cpu().clone()
         if self.config.partition_sampler == "single_chain_sequential":
-            if sweeps < self.config.mc_partitions or sweeps % self.config.mc_partitions:
-                raise ValueError("Need an equal positive number of sweeps per retained MC draw.")
-            # Continue the last draw from the preceding outer iteration.
-            # Only one RNG stream and one evolving chain state are used.
+            if sweeps < retained:
+                raise ValueError("sweeps must be at least retain_count for a single chain.")
+            # Continue the preceding iteration's last draw and RNG stream.
             state = states[-1].clone()
             draws = []
-            for _ in range(self.config.mc_partitions):
-                for _ in range(sweeps // self.config.mc_partitions):
-                    state = gibbs_sweep_exact_sse(
-                        z=z_cpu,
-                        labels=state,
-                        n_clusters=self.config.n_clusters,
-                        gibbs_precision=float(eta_mean),
-                        generator=self.chain_generators[0],
-                        random_scan=True,
-                    )
-                draws.append(state.clone())
+            for sweep_index in range(1, sweeps + 1):
+                state = gibbs_sweep_exact_sse(
+                    z=z_cpu,
+                    labels=state,
+                    n_clusters=self.config.n_clusters,
+                    gibbs_precision=float(eta_mean),
+                    generator=self.chain_generators[0],
+                    random_scan=True,
+                )
+                if sweep_index > sweeps - retained:
+                    draws.append(state.clone())
             return torch.stack(draws).to(return_device)
         for chain_index in range(states.shape[0]):
             for _ in range(sweeps):
@@ -788,9 +1037,7 @@ class TotalLossTrainer:
         observations = 0
         n = len(self.dataset)
         for batch in self.train_loader:
-            # Recompute at the parameters used by this gradient step.
-            # Supported architectures are deterministic (dropout=0, no BN);
-            # eval and train therefore define the same representation.
+            # Deterministic networks: current full-data means apply in train/eval mode.
             z_full = encode_full_dataset(self.model, self.eval_loader, self.device)
             means = self._partition_means(z_full, partitions.to(self.device)).detach()
             self.centroid_refresh_count += 1
@@ -957,17 +1204,14 @@ class TotalLossTrainer:
             f"optimizer={self.config.optimizer} | "
             f"lr_pretrain={self.config.lr_pretrain:.6g} | lr_joint={self.config.lr_joint:.6g}"
         )
-        calibration = None
-        if self.config.lambda_calibration_stage == "before_warmup":
-            self._log("[Calibration] Computing reconstruction weight at random initialization...")
-            calibration = self._calibrate_lambda()
-            self._log(f"[Calibration complete] lambda_R={self.lambda_reconstruction:.6g}")
+        if self.config.resolved_lambda_calibration_stage == "before_warmup":
+            self._run_lambda_calibration()
         partitions = self.pretrain().to(self.device)
-        if self.config.lambda_calibration_stage == "after_warmup":
-            self._log("[Calibration] Computing reconstruction weight after warmup...")
-            calibration = self._calibrate_lambda(partitions)
-            self._log(f"[Calibration complete] lambda_R={self.lambda_reconstruction:.6g}")
-        assert calibration is not None
+        if self.config.resolved_lambda_calibration_stage == "after_warmup":
+            self._run_lambda_calibration(partitions)
+        calibration = self.lambda_calibration_result
+        if calibration is None:
+            raise RuntimeError("The scheduled lambda calibration did not run.")
         eta = self._initialize_eta(partitions)
         self._log(
             f"[Eta initialization] {self.config.eta_initialization}: "
@@ -981,6 +1225,7 @@ class TotalLossTrainer:
                 partitions,
                 eta_mean=eta.effective_mean,
                 sweeps=self.config.initial_chain_burnin_sweeps,
+                retain_count=1,
             )
 
         for outer in range(self.config.outer_iterations):
@@ -1070,6 +1315,7 @@ class TotalLossTrainer:
             f"retained={self.config.posterior_samples} | thinning={self.config.posterior_thinning}"
         )
         if self.config.partition_sampler == "single_chain_sequential":
+            # Only the posterior sampler advances this final training state/RNG.
             partitions = partitions[-1:].clone()
         samples, partitions = self._draw_from_chains(
             z=final_z,
@@ -1125,20 +1371,8 @@ class TotalLossTrainer:
             torch.as_tensor(samples, dtype=torch.long, device=final_z.device),
             self.config.n_clusters,
         ).cpu().numpy()
-        # Summarize the production draws without feeding this estimate back
-        # into the sampler; its eta remains the last joint-training value.
-        final_eta = update_eta_posterior(
-            n=len(self.dataset),
-            p=int(self.dataset.x.shape[1]),
-            d=self.config.z_dim,
-            eta_a=self.config.eta_a,
-            eta_b=self.config.eta_b,
-            eta_shape_scale=self.config.eta_shape_scale,
-            eta_multiplier=self.config.eta_multiplier,
-            lambda_reconstruction=self.lambda_reconstruction,
-            full_reconstruction_sse=final_reconstruction_sse,
-            expected_cluster_sse=float(production_sses.mean()),
-        )
+        # Diagnostic only: the sampler keeps the last joint-training eta.
+        final_eta = self._eta_from_losses(final_reconstruction_sse, float(production_sses.mean()))
         representative, summary, representative_filename = self._posterior_summary(
             samples, psm
         )
@@ -1146,10 +1380,7 @@ class TotalLossTrainer:
 
         torch.save(self.model.state_dict(), self.output_dir / "model_state.pt")
         np.save(self.output_dir / "latent_final.npy", final_z.cpu().numpy())
-        self._save_diagnostic_array(
-            "persistent_partitions_final.npy",
-            partitions.cpu().numpy(),
-        )
+        self._save_diagnostic_array("persistent_partitions_final.npy", partitions.cpu().numpy())
         if self.partition_history:
             np.save(
                 self.output_dir / "persistent_partition_history.npy",
@@ -1162,12 +1393,32 @@ class TotalLossTrainer:
             {"role": "post-hoc recalculation only; not used in sampling", **asdict(final_eta)},
         )
         self._save_diagnostic_json("final_metrics.json", metrics)
+        sequential = self.config.partition_sampler == "single_chain_sequential"
+        sweeps, retained = self.config.gibbs_sweeps_per_outer, self.config.mc_partitions
         sampling_manifest = {
             "sampling_device": "cpu",
             "n_chains": self.config.n_chains,
             "partition_sampler": self.config.partition_sampler,
-            "joint_mc_draws_per_iteration": self.config.mc_partitions,
-            "joint_sweeps_per_chain_per_iteration": self.config.gibbs_sweeps_per_outer,
+            "joint_mc_draws_per_iteration": retained,
+            "joint_sweeps_per_chain_per_iteration": sweeps,
+            "joint_retention_policy": (
+                "last_m_consecutive_sweeps" if sequential else
+                "last_state_per_independent_chain"
+            ),
+            "joint_retained_sweep_indices_1based": (
+                list(range(sweeps - retained + 1, sweeps + 1)) if sequential else [sweeps]
+            ),
+            "posterior_initial_state_source": (
+                "last_training_partition" if sequential else
+                "last_state_of_each_training_chain"
+            ),
+            "posterior_continues_last_training_state": True,
+            "posterior_continues_training_rng_streams": True,
+            "posterior_network_frozen": True,
+            "posterior_eta_frozen": True,
+            "posterior_first_retained_sweep_after_training": (
+                self.config.posterior_burnin_sweeps + self.config.posterior_thinning
+            ),
             "chain_initial_seeds": self.chain_seeds,
             "burnin_sweeps_per_chain": self.config.posterior_burnin_sweeps,
             "thinning": self.config.posterior_thinning,
@@ -1195,9 +1446,13 @@ class TotalLossTrainer:
             "posterior_summary": summary.to_dict(),
             "representative_partition": representative_filename,
             "lambda_reconstruction": self.lambda_reconstruction,
+            "resolved_lambda_calibration_epoch": self.config.resolved_lambda_calibration_epoch,
+            "resolved_lambda_calibration_stage": self.config.resolved_lambda_calibration_stage,
             "lambda_calibration": calibration if self.config.save_diagnostics else {
                 key: calibration[key] for key in (
-                    "target_gradient_ratio_r0", "gradient_ratio_median", "calibration_batches"
+                    "target_gradient_ratio_r0", "gradient_ratio_median", "calibration_batches",
+                    "resolved_lambda_calibration_epoch", "resolved_lambda_calibration_stage",
+                    "pretrain_epochs_completed", "pretrain_gradient_steps",
                 ) if key in calibration
             },
             "eta": asdict(sampling_eta),
